@@ -445,6 +445,7 @@ final class FinishResilientPlace0 extends FinishResilient implements CustomSeria
     private val grlc:GlobalRef[AtomicInteger];
     private transient val ref:GlobalRef[FinishResilientPlace0] = GlobalRef[FinishResilientPlace0](this);
     private transient var isGlobal:Boolean = false;
+    private transient var deferGlobalization:Boolean = false;
     private transient var strictFinish:Boolean = false;
 
     // These fields are only valid / used in the root finish instance.
@@ -485,28 +486,25 @@ final class FinishResilientPlace0 extends FinishResilient implements CustomSeria
         strictFinish = true;
         if (!isGlobal) {
             if (verbose>=1) debug(">>>> doing globalInit for id="+id);
-            val parentId:Id;
-            if (parent instanceof FinishResilientPlace0) {
-                val frParent = parent as FinishResilientPlace0;
-                if (!frParent.isGlobal) frParent.globalInit();
-                parentId = frParent.id;
+            val parentId = getParentId();
+            if (deferGlobalization) {
+                if (verbose>=1) debug(">>>> deferring globalization to following message for id="+id);
             } else {
-                parentId = UNASSIGNED;
+                val gfs = this.ref;
+                val myId = this.id;
+                Runtime.runImmediateAt(place0, ()=>{ 
+                    try {
+                        lock.lock();
+                        val state = new State(myId, parentId, gfs);
+                        states.put(myId, state);
+                        State.increment(state.live, Task(gfs.home.id, ASYNC)); // duplicated from my localCount
+                        state.numActive = 1;
+                    } finally {
+                        lock.unlock();
+                    }
+                });
+                isGlobal = true;
             }
-            val gfs = this.ref;
-            val myId = this.id;
-            Runtime.runImmediateAt(place0, ()=>{ 
-                try {
-                    lock.lock();
-                    val state = new State(myId, parentId, gfs);
-                    states.put(myId, state);
-                    State.increment(state.live, Task(gfs.home.id, ASYNC)); // duplicated from my localCount
-                    state.numActive = 1;
-                } finally {
-                    lock.unlock();
-                }
-            });
-            isGlobal = true;
             if (verbose>=1) debug("<<<< globalInit returning fs="+this);
         }
         latch.unlock();
@@ -568,14 +566,7 @@ final class FinishResilientPlace0 extends FinishResilient implements CustomSeria
         } else {
             if (verbose>=1) debug(">>>> notifySubActivitySpawn(id="+myId+") called, srcId="+here.id + " dstId="+dstId+" kind="+kind);
             val gfs = this.ref;
-            val parentId:Id;
-            if (parent instanceof FinishResilientPlace0) {
-                val frParent = parent as FinishResilientPlace0;
-                if (!frParent.isGlobal) frParent.globalInit();
-                parentId = frParent.id;
-            } else {
-                parentId = UNASSIGNED;
-            }
+            val parentId = getParentId();
 
             Runtime.runImmediateAt(place0, ()=>{ 
                 try {
@@ -902,7 +893,6 @@ final class FinishResilientPlace0 extends FinishResilient implements CustomSeria
      */
     def spawnRemoteActivity(place:Place, body:()=>void, prof:x10.xrx.Runtime.Profile):void {
         val start = prof != null ? System.nanoTime() : 0;
-        isGlobal = true; // we're about to globalize this activity as part of the message to Place 0
         val ser = new Serializer();
         ser.writeAny(body);
         if (prof != null) {
@@ -913,22 +903,23 @@ final class FinishResilientPlace0 extends FinishResilient implements CustomSeria
         val bytes = ser.toRail();
 
         val gfs = this.ref;
-        val parentId:Id;
-            if (parent instanceof FinishResilientPlace0) {
-                val frParent = parent as FinishResilientPlace0;
-                if (!frParent.isGlobal) frParent.globalInit();
-                parentId = frParent.id;
-            } else {
-                parentId = UNASSIGNED;
-            }
-        val dstId = place.id;
+
         val myId = this.id;
+        val dstId = place.id;
+        val parentId = getParentId();
+
+        if (!isGlobal) {
+            // globalize this activity as part of the spawn message to Place 0
+            latch.lock(); // matching unlock at end of method
+            deferGlobalization = true;
+        }
+
+        localCount().incrementAndGet();  // synthetic activity to keep finish locally live during async to Place0
 
         if (bytes.size >= ASYNC_SIZE_THRESHOLD) {
             if (verbose >= 1) debug("==== spawnRemoteActivity(id="+myId+") selecting indirect (size="+
                                     bytes.size+") srcId="+here.id + " dstId="+dstId);
 
-            localCount().incrementAndGet();  // synthetic activity to keep finish locally live during async to Place0
             val wrappedBody = ()=> @AsyncClosure {
                 val deser = new Deserializer(bytes);
                 val bodyPrime = deser.readAny() as ()=>void;
@@ -1013,8 +1004,32 @@ final class FinishResilientPlace0 extends FinishResilient implements CustomSeria
                     // can ignore; if the place just died there is no need to worry about submitting the activity
                     if (verbose>=2) debug("caught and suppressed DPE when attempting spawnRemoteActivity_dstPlace for "+myId);
                 }
+
+                try {
+                    at (gfs) @Immediate("spawnRemoteActivity_dec_local_count") async {
+                        gfs().notifyActivityTermination(); // end of synthetic local activity
+                    }
+                } catch (dpe:DeadPlaceException) {
+                    // can ignore; if the place just died here is no need to worry about updating local count
+                    if (verbose>=2) debug("caught and suppressed DPE when attempting spawnRemoteActivity_dec_local_count for "+myId);
+                }
             }
-            if (verbose>=1) debug("<<<< spawnRemoteActivity(id="+myId+") returning");
+        }
+        if (!isGlobal) {
+            // state is now globalized.  must unlock
+            isGlobal = true;
+            latch.unlock();
+        }
+        if (verbose>=1) debug("<<<< spawnRemoteActivity(id="+myId+") returning");
+    }
+
+    private final def getParentId():Id {
+        if (parent instanceof FinishResilientPlace0) {
+            val frParent = parent as FinishResilientPlace0;
+            if (!frParent.isGlobal) frParent.globalInit();
+            return frParent.id;
+        } else {
+            return UNASSIGNED;
         }
     }
 
